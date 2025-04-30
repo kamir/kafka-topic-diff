@@ -1,0 +1,99 @@
+version: '3'
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        # Create test topics
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic test-topic-1 --partitions 1 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic test-topic-2 --partitions 1 --replication-factor 1
+        
+        # Produce test messages to topic-1
+        echo '{"id": 1, "message": "test-message-1"}' | kafka-console-producer --bootstrap-server kafka:29092 --topic test-topic-1
+        echo '{"id": 2, "message": "test-message-2"}' | kafka-console-producer --bootstrap-server kafka:29092 --topic test-topic-1
+        echo '{"id": 3, "message": "test-message-3"}' | kafka-console-producer --bootstrap-server kafka:29092 --topic test-topic-1
+        
+        # Produce test messages to topic-2 (with one difference)
+        echo '{"id": 1, "message": "test-message-1"}' | kafka-console-producer --bootstrap-server kafka:29092 --topic test-topic-2
+        echo '{"id": 2, "message": "test-message-2-DIFFERENT"}' | kafka-console-producer --bootstrap-server kafka:29092 --topic test-topic-2
+        echo '{"id": 3, "message": "test-message-3"}' | kafka-console-producer --bootstrap-server kafka:29092 --topic test-topic-2
+      "
+
+  test-runner:
+    image: python:3.9
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KDIFF_CONFIG_DIR=/tmp/kdiff_test
+    command: >
+      bash -c "
+        # Install requirements
+        pip install -e .
+        pip install pytest pytest-cov
+        
+        # Create test config directory
+        mkdir -p /tmp/kdiff_test/clusters
+        
+        # Create test cluster config
+        echo 'bootstrap.servers=kafka:29092' > /tmp/kdiff_test/clusters/test-cluster.properties
+        echo 'client.id=kdiff-integration-test' >> /tmp/kdiff_test/clusters/test-cluster.properties
+        
+        # Create clusters.yaml
+        echo 'clusters:' > /tmp/kdiff_test/clusters.yaml
+        echo '  test-cluster:' >> /tmp/kdiff_test/clusters.yaml
+        echo '    config_file: test-cluster.properties' >> /tmp/kdiff_test/clusters.yaml
+        
+        # Run integration tests
+        pytest -xvs kdiff/tests/integration/
+      "
